@@ -27,11 +27,40 @@ class TestResolveSafeCwd:
         path = str(tmp_path)
         assert _resolve_safe_cwd(path) == path
 
-    def test_walks_up_to_first_existing_ancestor(self, tmp_path):
+    def test_recreates_missing_path_in_place(self, tmp_path):
+        """A missing cwd whose parent still exists is re-materialised in
+        place rather than falling back to the parent — the anti-cross-card
+        leak fix (secops t_9db280e4).
+        """
         nested = tmp_path / "child" / "grandchild"
         nested.mkdir(parents=True)
         deleted = str(nested)
         shutil.rmtree(tmp_path / "child")
+        assert not os.path.isdir(deleted)
+
+        result = _resolve_safe_cwd(deleted)
+
+        assert result == deleted
+        assert os.path.isdir(deleted)
+
+    def test_walks_up_when_recreation_fails(self, tmp_path, monkeypatch):
+        """If ``os.makedirs`` raises (permissions, ``/dev/null/…``,
+        broken mount), the walk-up ancestor fallback must still fire so
+        the terminal doesn't wedge — regression protection for #17558.
+        """
+        nested = tmp_path / "child" / "grandchild"
+        nested.mkdir(parents=True)
+        deleted = str(nested)
+        shutil.rmtree(tmp_path / "child")
+
+        real_makedirs = os.makedirs
+
+        def raising_makedirs(path, *args, **kwargs):
+            if path == deleted:
+                raise PermissionError("simulated: cannot recreate")
+            return real_makedirs(path, *args, **kwargs)
+
+        monkeypatch.setattr(os, "makedirs", raising_makedirs)
 
         # The deepest existing ancestor on the path is tmp_path itself.
         assert _resolve_safe_cwd(deleted) == str(tmp_path)
@@ -41,6 +70,11 @@ class TestResolveSafeCwd:
 
     def test_returns_tempdir_when_nothing_on_path_exists(self, monkeypatch):
         monkeypatch.setattr(os.path, "isdir", lambda p: False)
+        # Also make recreation fail so the walk-up fallback is exercised
+        # deterministically (see test_walks_up_when_recreation_fails).
+        monkeypatch.setattr(
+            os, "makedirs", lambda *a, **kw: (_ for _ in ()).throw(PermissionError())
+        )
         assert _resolve_safe_cwd("/no/such/dir") == tempfile.gettempdir()
 
     def test_returns_root_when_only_root_exists(self, monkeypatch):
@@ -49,6 +83,9 @@ class TestResolveSafeCwd:
         ``os.path.dirname('/') == '/'`` is the loop's exit condition."""
         sep = os.path.sep
         monkeypatch.setattr(os.path, "isdir", lambda p: p == sep)
+        monkeypatch.setattr(
+            os, "makedirs", lambda *a, **kw: (_ for _ in ()).throw(PermissionError())
+        )
         assert _resolve_safe_cwd("/no/such/deep/dir") == sep
 
 
@@ -98,7 +135,14 @@ class TestRunBashCwdRecovery:
     def test_recovers_when_cwd_deleted_after_init(self, tmp_path, caplog):
         """Reproduces the wedge from #17558: cwd was valid when the
         snapshot was taken, but a subsequent command deleted it before the
-        next ``Popen``."""
+        next ``Popen``.
+
+        Under the current (post-t_4110106a) behaviour the resolver
+        self-heals: it recreates the exact deleted path in place rather
+        than falling back to the parent, so relative writes stay isolated
+        to this session and don't leak into a directory shared across
+        every kanban card on a board.
+        """
         wedged = tmp_path / "wedge-repro"
         wedged.mkdir()
 
@@ -115,20 +159,28 @@ class TestRunBashCwdRecovery:
             with patch("tools.environments.local._find_bash", return_value="/bin/bash"), \
                  patch("subprocess.Popen", side_effect=_make_fake_popen(captured, fds)), \
                  patch("tools.terminal_tool._interrupt_event", _fake_interrupt()), \
-                 caplog.at_level("WARNING", logger="tools.environments.local"):
+                 caplog.at_level("ERROR", logger="tools.environments.local"):
                 env.execute("echo hello")
         finally:
             _close_fds(fds)
 
-        # Popen must have been handed a real, existing directory.
-        assert captured["cwd"] == str(tmp_path)
+        # Popen must have been handed a real, existing directory — and it
+        # must be the ORIGINAL wedged path (self-heal), not a parent
+        # ancestor (cross-card leak).
+        assert captured["cwd"] == str(wedged)
         assert os.path.isdir(captured["cwd"])
 
-        # ``self.cwd`` is updated so the next call doesn't re-warn.
-        assert env.cwd == str(tmp_path)
+        # ``self.cwd`` is not downgraded to a parent ancestor.
+        assert env.cwd == str(wedged)
 
-        # The warning surfaces the wedge so it isn't silently masked.
-        assert any("missing on disk" in rec.message for rec in caplog.records)
+        # The recovery is logged at ERROR so downstream tooling / log
+        # analysis can surface the workspace race.
+        recreate_records = [
+            rec for rec in caplog.records
+            if "recreated in place" in rec.message
+        ]
+        assert recreate_records, "expected an ERROR log about recreating cwd in place"
+        assert all(rec.levelname == "ERROR" for rec in recreate_records)
 
     def test_no_warning_when_cwd_still_exists(self, tmp_path, caplog):
         with patch.object(LocalEnvironment, "init_session", autospec=True, return_value=None):
@@ -147,7 +199,13 @@ class TestRunBashCwdRecovery:
 
         assert captured["cwd"] == str(tmp_path)
         assert env.cwd == str(tmp_path)
-        assert not any("missing on disk" in rec.message for rec in caplog.records)
+        # No recovery log of any severity when the cwd was healthy.
+        assert not any(
+            "missing on disk" in rec.message
+            or "recreated in place" in rec.message
+            or "un-recreatable" in rec.message
+            for rec in caplog.records
+        )
 
 
 class TestUpdateCwdRejectsMissingPaths:
