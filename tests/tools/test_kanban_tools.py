@@ -798,6 +798,58 @@ def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
         conn.close()
 
 
+def test_create_scratch_worker_does_NOT_inherit_scratch_path(monkeypatch, worker_env):
+    """Regression for the scratch handoff race (secops t_9db280e4).
+
+    When a worker with an ephemeral ``scratch`` workspace calls
+    kanban_create without workspace args, the child must NOT inherit
+    the parent's scratch path — that path is tmp-owned by the sender's
+    task lifecycle and gets cleaned when the sender completes. Binding
+    the child to it creates a silent-data-loss window (write_file
+    FileNotFoundError storm). The child must get its own fresh scratch
+    workspace (workspace_path=None, resolved at spawn time), decoupled
+    from the referring card's completion.
+    """
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    # Simulate the parent worker's already-resolved scratch path — the
+    # exact shape a running worker task has in the DB (see the real-world
+    # repro: /kanban/boards/noc/workspaces/t_2f101568).
+    parent_scratch = "/tmp/kanban/workspaces/t_parent_scratch"
+    conn = kb.connect()
+    try:
+        self_tid = kb.create_task(
+            conn, title="scratch worker", assignee="test-worker",
+            workspace_kind="scratch", workspace_path=parent_scratch,
+        )
+        kb.claim_task(conn, self_tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", self_tid)
+
+    d = json.loads(kt._handle_create({"title": "handoff child", "assignee": "peer"}))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        # Child still gets a scratch workspace (the sensible default for
+        # a worker with no persistent project checkout to inherit) but
+        # NOT the parent's path — the whole point of the fix.
+        assert child.workspace_kind == "scratch"
+        assert child.workspace_path != parent_scratch, (
+            "child inherited parent's scratch path — Schrödinger workspace "
+            "regression (secops t_9db280e4)"
+        )
+        # The create-path leaves scratch workspace_path as None so the
+        # dispatcher can allocate a fresh dir for the child at spawn time.
+        # Assert the shape that decouples lifetime, so a future change
+        # that re-introduces a per-caller shortcut still trips this test.
+        assert child.workspace_path is None
+    finally:
+        conn.close()
+
+
 def test_create_explicit_workspace_beats_inheritance(monkeypatch, worker_env):
     """An explicit workspace arg overrides worker-task inheritance."""
     from tools import kanban_tools as kt
