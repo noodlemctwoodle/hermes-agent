@@ -40,28 +40,69 @@ def _msys_to_windows_path(cwd: str) -> str:
 
 
 def _resolve_safe_cwd(cwd: str) -> str:
-    """Return ``cwd`` if it exists as a directory, else the nearest existing
-    ancestor.  Falls back to ``tempfile.gettempdir()`` only if walking up the
-    path can't find any existing directory (effectively never on a healthy
-    filesystem, but cheap belt-and-braces).
+    """Return a usable working directory for ``Popen(..., cwd=...)``.
 
-    On Windows, also normalizes Git Bash / MSYS-style POSIX paths
-    (``/c/Users/x``) to native Windows form before the isdir check so a
-    perfectly valid ``pwd -P`` result from bash doesn't get rejected as
-    "missing" (see ``_msys_to_windows_path``).
+    Resolution order:
 
-    Used by ``_run_bash`` to recover when the configured cwd is gone — most
-    commonly because a previous tool call deleted its own working directory
-    (issue #17558).  Without this guard, ``subprocess.Popen(..., cwd=...)``
-    raises ``FileNotFoundError`` before bash starts, wedging every subsequent
-    terminal call until the gateway restarts.
+    1. If ``cwd`` exists as a directory, return it unchanged.  On Windows,
+       Git Bash / MSYS POSIX paths (``/c/Users/x``) are first normalised to
+       native Windows form so ``pwd -P`` output from bash isn't mistakenly
+       treated as "missing" (see ``_msys_to_windows_path``).
+    2. If ``cwd`` is missing, try to re-materialise it in place with
+       ``os.makedirs(cwd, exist_ok=True)`` and return it.  Rationale:
+       another session (typically a kanban card whose scratch workspace was
+       cleaned up on completion) can remove this session's cwd out from
+       under it; walking to the shared parent would silently leak any
+       subsequent relative writes into a directory shared across every
+       card on that board.  Recreating the exact path keeps this session
+       isolated.  Logged at ERROR so downstream tooling can surface the
+       race.  Preserves the issue #17558 self-deletion recovery: a tool
+       call that ``rm -rf``'d its own cwd is recreated in place instead
+       of the next ``Popen`` raising ``FileNotFoundError``.
+    3. If the re-materialisation fails (permissions, ``/dev/null/…``,
+       broken mount), walk up the parent chain and return the first
+       ancestor that exists.  Logged at ERROR — the fallback keeps the
+       terminal alive (regression protection for #17558) but subsequent
+       relative writes may leak into that ancestor, so this must not be
+       silent.
+    4. As a last belt-and-braces fallback (root missing, everything
+       gone), return ``tempfile.gettempdir()``.
     """
     cwd = _msys_to_windows_path(cwd) if _IS_WINDOWS else cwd
     if cwd and os.path.isdir(cwd):
         return cwd
+
+    # Step 2 — self-heal.  This is the anti-leak path: a scratch workspace
+    # cleanup by another card must NOT silently downgrade this session to
+    # its shared parent (cross-card leak).  See secops t_9db280e4 root cause
+    # and the ``_inherit_workspace`` sibling fix in ``tools/kanban_tools.py``
+    # (t_0463137b).
+    if cwd:
+        try:
+            os.makedirs(cwd, exist_ok=True)
+        except OSError:
+            pass  # Un-recreatable — fall through to walk-up ancestor.
+        else:
+            logger.error(
+                "LocalEnvironment cwd %r was missing on disk; recreated "
+                "in place. If this repeats, investigate cross-card "
+                "workspace race.",
+                cwd,
+            )
+            return cwd
+
+    # Step 3 — walk-up fallback.  Reached only when self-heal failed;
+    # keeps the terminal alive but is a leak risk, so log loudly.
     parent = os.path.dirname(cwd) if cwd else ""
     while parent:
         if os.path.isdir(parent):
+            logger.error(
+                "LocalEnvironment cwd %r missing and un-recreatable; "
+                "falling back to ancestor %r — subsequent relative "
+                "writes may leak across sessions.",
+                cwd,
+                parent,
+            )
             return parent
         next_parent = os.path.dirname(parent)
         if next_parent == parent:
@@ -563,29 +604,26 @@ class LocalEnvironment(BaseEnvironment):
         args = [bash, "-l", "-c", cmd_string] if login else [bash, "-c", cmd_string]
         run_env = _make_run_env(self.env)
 
-        # Recover when the cwd has been deleted out from under us — usually by
-        # a previous tool call that ran ``rm -rf`` on its own working dir
-        # (issue #17558).  Popen would otherwise raise FileNotFoundError on
-        # the cwd before bash starts, wedging every subsequent call until the
-        # gateway restarts.
+        # Recover when the cwd has been deleted out from under us. Two
+        # distinct causes handled by ``_resolve_safe_cwd``:
+        # - Self-deletion by a previous tool call that ``rm -rf``'d its own
+        #   working dir (issue #17558) — the helper re-materialises the
+        #   path in place so Popen doesn't raise FileNotFoundError before
+        #   bash starts.
+        # - Cross-session deletion where another kanban card's scratch
+        #   cleanup removes this session's cwd — the helper still
+        #   re-materialises in place (rather than walking to the shared
+        #   parent), keeping any subsequent relative writes isolated to
+        #   this session. See secops t_9db280e4 for the incident report
+        #   and ``tools/kanban_tools.py`` t_0463137b for the sibling fix.
         #
+        # The helper logs at ERROR when it self-heals or falls back to an
+        # ancestor; the assignment below just tracks the resolution.
         # On Windows, ``_resolve_safe_cwd`` also normalises Git Bash-style
-        # POSIX paths (``/c/Users/...``) to native form so a perfectly valid
-        # ``pwd -P`` result from bash isn't mistakenly treated as "missing"
-        # and spammed as a warning on every command.
+        # POSIX paths (``/c/Users/...``) to native form so a perfectly
+        # valid ``pwd -P`` result from bash isn't misread as "missing".
         safe_cwd = _resolve_safe_cwd(self.cwd)
         if safe_cwd != self.cwd:
-            # MSYS → Windows translation alone shouldn't surface as a warning
-            # (it's a benign normalization, not a recovery). Only warn when
-            # the directory really doesn't exist on disk.
-            normalized = _msys_to_windows_path(self.cwd) if _IS_WINDOWS else self.cwd
-            if safe_cwd != normalized:
-                logger.warning(
-                    "LocalEnvironment cwd %r is missing on disk; "
-                    "falling back to %r so terminal commands keep working.",
-                    self.cwd,
-                    safe_cwd,
-                )
             self.cwd = safe_cwd
 
         _popen_cwd = self.cwd
