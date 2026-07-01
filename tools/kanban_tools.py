@@ -786,11 +786,23 @@ def _handle_create(args: dict, **kw) -> str:
         try:
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
+            # Restrict inheritance to PERSISTENT workspace kinds
+            # (dir / worktree). A ``scratch`` workspace is tmp-owned by the
+            # spawning task and cleaned when *that* task completes; letting
+            # the child inherit the same path binds its lifetime to the
+            # sender and creates a silent-data-loss window when the sender
+            # completes first (Schrödinger workspace — see secops
+            # t_9db280e4 for the real-world repro). For ``scratch``, fall
+            # through and let the child get its own fresh scratch dir.
             if _inherit_workspace:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
+                    if (
+                        _self_task is not None
+                        and _self_task.workspace_kind
+                        and _self_task.workspace_kind != "scratch"
+                    ):
                         workspace_kind = _self_task.workspace_kind
                         workspace_path = _self_task.workspace_path
             new_tid = kb.create_task(
